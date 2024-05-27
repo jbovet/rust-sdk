@@ -78,10 +78,7 @@ impl FeatureProvider for NoOpProvider {
 }
 
 fn just_error<T>() -> EvaluationResult<T> {
-    Err(EvaluationError::builder()
-        .code(EvaluationErrorCode::ProviderNotReady)
-        .message("No-op provider is never ready")
-        .build())
+    Err(EvaluationError::new(EvaluationErrorCode::ProviderNotReady))
 }
 
 // ============================================================

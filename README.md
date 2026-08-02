@@ -69,7 +69,8 @@ async fn example() -> Result<(), Error> {
 
     // Configure a provider.
     // By default [`NoOpProvider`] is used.
-    api.set_provider(NoOpProvider::default()).await;
+    // This initializes the provider and returns the initialization result.
+    api.set_provider(NoOpProvider::default()).await.ok();
 
     // create a client
     let client = api.create_client();
@@ -95,7 +96,8 @@ async fn extended_example() {
     let mut api = OpenFeature::singleton_mut().await;
 
     // Set the default (unnamed) provider.
-    api.set_provider(NoOpProvider::default()).await;
+    // This initializes the provider and returns the initialization result.
+    api.set_provider(NoOpProvider::default()).await.ok();
 
     // Create an unnamed client.
     let client = api.create_client();
@@ -154,7 +156,7 @@ See [here](https://docs.rs/open-feature/latest/open_feature/index.html) for the 
 | ✅      | [Hooks](#hooks)                 | Add functionality to various stages of the flag evaluation life-cycle.                                                             |
 | ✅      | [Logging](#logging)             | Integrate with popular logging packages.                                                                                           |
 | ✅      | [Named clients](#named-clients) | Utilize multiple providers in a single application.                                                                                |
-| ❌      | [Eventing](#eventing)           | React to state changes in the provider or flag management system.                                                                  |
+| ✅      | [Eventing](#eventing)           | React to state changes in the provider or flag management system.                                                                  |
 | ✅      | [Shutdown](#shutdown)           | Gracefully clean up a provider during application shutdown.                                                                        |
 | ✅      | [Extending](#extending)         | Extend OpenFeature with custom providers and hooks.                                                                                |
 
@@ -180,7 +182,8 @@ Once you've added a provider as a dependency, it can be registered with OpenFeat
 //
 // You must `await` it to let the provider's initialization to finish.
 let mut api = OpenFeature::singleton_mut().await;
-api.set_provider(NoOpProvider::default()).await;
+// This initializes the provider and returns the initialization result.
+api.set_provider(NoOpProvider::default()).await.ok();
 ```
 
 In some situations, it may be beneficial to register multiple providers in the same application.
@@ -302,7 +305,7 @@ If a name has no associated provider, the global provider is used.
 
 ```rust
 // Create a named provider and bind it.
-api.set_named_provider("named", NoOpProvider::default()).await;
+api.set_named_provider("named", NoOpProvider::default()).await.ok();
 
 // This named client will use the feature provider bound to this name.
 let client = api.create_named_client("named");
@@ -311,17 +314,41 @@ assert_eq!(client.get_int_value("key", None, None).await.unwrap(), 42);
 ```
 ### Eventing
 
-Events are not yet available in the Rust SDK.
-
-<!-- TOOD: Uncomment it when we support events
 Events allow you to react to state changes in the provider or underlying flag management system, such as flag definition changes, provider readiness, or error conditions.
 Initialization events (`PROVIDER_READY` on success, `PROVIDER_ERROR` on failure) are dispatched for every provider.
 Some providers support additional events, such as `PROVIDER_CONFIGURATION_CHANGED`.
 
 Please refer to the documentation of the provider you're using to see what events are supported.
--->
 
-<!-- TODO: code example of a PROVIDER_CONFIGURATION_CHANGED event for the client and a PROVIDER_STALE event for the API -->
+Handlers can be registered at the API level (they run for events from any provider) or at the client level (they only run for events from the provider associated with that client's name).
+Handlers registered after a provider is already in the associated state run immediately.
+
+```rust
+use open_feature::{OpenFeature, ProviderEventType};
+
+let mut api = OpenFeature::singleton_mut().await;
+
+// An API-level handler, run for events from any provider.
+api.add_handler(ProviderEventType::Stale, |details| {
+    println!("provider {} became stale", details.provider_name);
+})
+.await;
+
+api.set_provider(NoOpProvider::default()).await.ok();
+
+// A client-level handler, only run for events from the provider bound to this client.
+let client = api.create_named_client("my-domain");
+client
+    .add_handler(ProviderEventType::ConfigurationChanged, |details| {
+        println!("flags changed: {:?}", details.flags_changed);
+    })
+    .await;
+```
+
+`add_handler` returns an id that can be passed to `remove_handler` to unregister the handler.
+The SDK also tracks the status of each provider based on its initialization outcome and emitted events; query it with `api.provider_status()`, `api.named_provider_status(name)` or `client.provider_status()`.
+
+Providers emit events through the `EventEmitter` handle passed to them via `FeatureProvider::attach_emitter` right before initialization — see [`examples/events.rs`](examples/events.rs) for a complete provider that emits events.
 
 ### Shutdown
 

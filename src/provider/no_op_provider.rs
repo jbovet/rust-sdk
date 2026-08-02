@@ -172,7 +172,10 @@ mod tests {
     async fn initialize() {
         let mut provider = NoOpProvider::default();
 
-        provider.initialize(&EvaluationContext::default()).await;
+        assert!(provider
+            .initialize(&EvaluationContext::default())
+            .await
+            .is_ok());
     }
 
     #[spec(

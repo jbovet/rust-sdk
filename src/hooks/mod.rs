@@ -241,7 +241,7 @@ mod tests {
             .hints
             .insert("key2".to_string(), Value::String("value".to_string()));
         hints.hints.insert("key3".to_string(), Value::Int(42));
-        hints.hints.insert("key4".to_string(), Value::Float(3.14));
+        hints.hints.insert("key4".to_string(), Value::Float(3.5));
         hints.hints.insert("key5".to_string(), Value::Array(vec![]));
         hints
             .hints
@@ -254,7 +254,7 @@ mod tests {
             Some(&Value::String("value".to_string()))
         );
         assert_eq!(hints.hints.get("key3"), Some(&Value::Int(42)));
-        assert_eq!(hints.hints.get("key4"), Some(&Value::Float(3.14)));
+        assert_eq!(hints.hints.get("key4"), Some(&Value::Float(3.5)));
         assert_eq!(hints.hints.get("key5"), Some(&Value::Array(vec![])));
         assert_eq!(
             hints.hints.get("key6"),
@@ -305,7 +305,8 @@ mod tests {
         let mut mock_provider = MockFeatureProvider::default();
 
         mock_provider.expect_hooks().return_const(vec![]);
-        mock_provider.expect_initialize().return_const(());
+        mock_provider.expect_initialize().return_const(Ok(()));
+        mock_provider.expect_attach_emitter().return_const(());
         mock_provider
             .expect_metadata()
             .return_const(ProviderMetadata::default());
@@ -322,7 +323,7 @@ mod tests {
             })
             .return_const(Ok(ResolutionDetails::new(true)));
 
-        api.set_provider(mock_provider).await;
+        api.set_provider(mock_provider).await.ok();
         drop(api);
 
         let flag_key = "flag";
@@ -441,7 +442,8 @@ mod tests {
         let mut mock_provider = MockFeatureProvider::default();
 
         mock_provider.expect_hooks().return_const(vec![]);
-        mock_provider.expect_initialize().return_const(());
+        mock_provider.expect_initialize().return_const(Ok(()));
+        mock_provider.expect_attach_emitter().return_const(());
         mock_provider
             .expect_metadata()
             .return_const(ProviderMetadata::default());
@@ -453,7 +455,7 @@ mod tests {
             })
             .return_const(Ok(ResolutionDetails::new("value")));
 
-        api.set_provider(mock_provider).await;
+        api.set_provider(mock_provider).await.ok();
         drop(api);
 
         client = client.with_hook(mock_hook);
@@ -480,7 +482,8 @@ mod tests {
         let mut seq = mockall::Sequence::new();
 
         mock_provider.expect_hooks().return_const(vec![]);
-        mock_provider.expect_initialize().return_const(());
+        mock_provider.expect_initialize().return_const(Ok(()));
+        mock_provider.expect_attach_emitter().return_const(());
         mock_provider
             .expect_metadata()
             .return_const(ProviderMetadata::default());
@@ -490,7 +493,7 @@ mod tests {
             .in_sequence(&mut seq)
             .return_const(Ok(ResolutionDetails::new(true)));
 
-        api.set_provider(mock_provider).await;
+        api.set_provider(mock_provider).await.ok();
         drop(api);
 
         mock_hook.expect_before().returning(|_, _| Ok(None));
@@ -531,13 +534,14 @@ mod tests {
             let mut seq = mockall::Sequence::new();
 
             mock_provider.expect_hooks().return_const(vec![]);
-            mock_provider.expect_initialize().return_const(());
+            mock_provider.expect_initialize().return_const(Ok(()));
+            mock_provider.expect_attach_emitter().return_const(());
             mock_provider.expect_resolve_bool_value().never();
             mock_provider
                 .expect_metadata()
                 .return_const(ProviderMetadata::default());
 
-            api.set_provider(mock_provider).await;
+            api.set_provider(mock_provider).await.ok();
             drop(api);
 
             mock_hook.expect_before().returning(|_, _| error());
@@ -587,7 +591,8 @@ mod tests {
             let mut seq = mockall::Sequence::new();
 
             mock_provider.expect_hooks().return_const(vec![]);
-            mock_provider.expect_initialize().return_const(());
+            mock_provider.expect_initialize().return_const(Ok(()));
+            mock_provider.expect_attach_emitter().return_const(());
             mock_provider
                 .expect_metadata()
                 .return_const(ProviderMetadata::default());
@@ -608,7 +613,7 @@ mod tests {
 
             mock_hook.expect_finally().return_const(());
 
-            api.set_provider(mock_provider).await;
+            api.set_provider(mock_provider).await.ok();
             drop(api);
 
             // evaluation
@@ -638,7 +643,8 @@ mod tests {
         let mut seq = mockall::Sequence::new();
 
         mock_provider.expect_hooks().return_const(vec![]);
-        mock_provider.expect_initialize().return_const(());
+        mock_provider.expect_initialize().return_const(Ok(()));
+        mock_provider.expect_attach_emitter().return_const(());
         mock_provider
             .expect_metadata()
             .return_const(ProviderMetadata::default());
@@ -646,7 +652,7 @@ mod tests {
             .expect_resolve_bool_value()
             .return_const(Ok(ResolutionDetails::new(true)));
 
-        api.set_provider(mock_provider).await;
+        api.set_provider(mock_provider).await.ok();
 
         mock_hook
             .expect_before()
@@ -785,12 +791,13 @@ mod tests {
         provider
             .expect_hooks()
             .return_const(vec![HookWrapper::new(mock_provider_hook)]);
-        provider.expect_initialize().return_const(());
+        provider.expect_initialize().return_const(Ok(()));
+        provider.expect_attach_emitter().return_const(());
         provider
             .expect_metadata()
             .return_const(ProviderMetadata::default());
 
-        api.set_provider(provider).await;
+        api.set_provider(provider).await.ok();
         api.add_hook(mock_api_hook).await;
         client = client.with_hook(mock_client_hook);
 
@@ -827,13 +834,14 @@ mod tests {
         let mut seq = mockall::Sequence::new();
 
         mock_provider.expect_hooks().return_const(vec![]);
-        mock_provider.expect_initialize().return_const(());
+        mock_provider.expect_initialize().return_const(Ok(()));
+        mock_provider.expect_attach_emitter().return_const(());
         mock_provider.expect_resolve_bool_value().never();
         mock_provider
             .expect_metadata()
             .return_const(ProviderMetadata::default());
 
-        api.set_provider(mock_provider).await;
+        api.set_provider(mock_provider).await.ok();
 
         mock_hook
             .expect_before()
@@ -949,12 +957,13 @@ mod tests {
         provider
             .expect_hooks()
             .return_const(vec![HookWrapper::new(mock_provider_hook)]);
-        provider.expect_initialize().return_const(());
+        provider.expect_initialize().return_const(Ok(()));
+        provider.expect_attach_emitter().return_const(());
         provider
             .expect_metadata()
             .return_const(ProviderMetadata::default());
 
-        api.set_provider(provider).await;
+        api.set_provider(provider).await.ok();
         api.add_hook(mock_api_hook).await;
         client = client.with_hook(mock_client_hook);
 
@@ -984,7 +993,10 @@ mod tests {
     ) -> MockFeatureProvider {
         let mut mock_provider = MockFeatureProvider::default();
         mock_provider.expect_hooks().return_const(vec![]);
-        mock_provider.expect_initialize().return_const(());
+        // The SDK attaches an emitter right before `initialize`, and `initialize` returns a
+        // `Result` from which it derives the terminal PROVIDER_READY/PROVIDER_ERROR event.
+        mock_provider.expect_attach_emitter().return_const(());
+        mock_provider.expect_initialize().return_const(Ok(()));
         mock_provider
             .expect_metadata()
             .return_const(ProviderMetadata::default());
@@ -1075,7 +1087,7 @@ mod tests {
         let client = api.create_named_client("test").with_hook(StateSharingHook {
             stages_run: Arc::clone(&stages),
         });
-        api.set_provider(provider_resolving_bool(result)).await;
+        api.set_provider(provider_resolving_bool(result)).await.ok();
         drop(api);
 
         let evaluation = client.get_bool_value("flag", None, None).await;
@@ -1207,7 +1219,7 @@ mod tests {
                     checks: Arc::clone(&checks),
                 });
 
-            api.set_provider(provider_resolving_bool(result)).await;
+            api.set_provider(provider_resolving_bool(result)).await.ok();
             drop(api);
 
             let _ = client.get_bool_value("flag", None, None).await;
@@ -1296,7 +1308,8 @@ mod tests {
             });
 
         api.set_provider(provider_resolving_bool(Ok(ResolutionDetails::new(true))))
-            .await;
+            .await
+            .ok();
         drop(api);
 
         // Two evaluations with the same client (and thus the same hook instance).

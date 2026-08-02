@@ -2,14 +2,17 @@ use std::sync::OnceLock;
 
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+use std::sync::Arc;
+
 use crate::{
-    provider::{FeatureProvider, ProviderMetadata},
-    Client, EvaluationContext, Hook, HookWrapper,
+    provider::{FeatureProvider, ProviderMetadata, ProviderStatus},
+    Client, EvaluationContext, EvaluationError, EventDetails, EventHandlerId, Hook, HookWrapper,
+    ProviderEventType,
 };
 
 use super::{
-    global_evaluation_context::GlobalEvaluationContext, global_hooks::GlobalHooks,
-    provider_registry::ProviderRegistry,
+    event_registry::EventRegistry, global_evaluation_context::GlobalEvaluationContext,
+    global_hooks::GlobalHooks, provider_registry::ProviderRegistry,
 };
 
 /// The singleton instance of [`OpenFeature`] struct.
@@ -22,12 +25,26 @@ fn get_singleton() -> &'static RwLock<OpenFeature> {
 
 /// THE struct of the OpenFeature API.
 /// Access it via [`OpenFeature::singleton()`] or [`OpenFeature::singleton_mut()`].
-#[derive(Default)]
 pub struct OpenFeature {
     evaluation_context: GlobalEvaluationContext,
     hooks: GlobalHooks,
+    events: EventRegistry,
 
     provider_registry: ProviderRegistry,
+}
+
+impl Default for OpenFeature {
+    fn default() -> Self {
+        let evaluation_context = GlobalEvaluationContext::default();
+        let events = EventRegistry::default();
+
+        Self {
+            evaluation_context: evaluation_context.clone(),
+            hooks: GlobalHooks::default(),
+            events: events.clone(),
+            provider_registry: ProviderRegistry::new(evaluation_context, events),
+        }
+    }
 }
 
 impl OpenFeature {
@@ -50,19 +67,78 @@ impl OpenFeature {
     }
 
     /// Set the default provider.
-    pub async fn set_provider<T: FeatureProvider>(&mut self, provider: T) {
-        self.provider_registry.set_default(provider).await;
+    ///
+    /// This function initializes the provider and returns the initialization result. Even when
+    /// initialization fails, the provider stays registered (in `Error` status), so the returned
+    /// error may safely be ignored — discard it explicitly with `.ok()` to avoid the
+    /// `unused_must_use` warning:
+    ///
+    /// ```no_run
+    /// # async fn run() {
+    /// # use open_feature::OpenFeature;
+    /// # use open_feature::provider::NoOpProvider;
+    /// # let mut api = OpenFeature::default();
+    /// api.set_provider(NoOpProvider::default()).await.ok();
+    /// # }
+    /// ```
+    pub async fn set_provider<T: FeatureProvider>(
+        &mut self,
+        provider: T,
+    ) -> Result<(), EvaluationError> {
+        self.provider_registry.set_default(provider).await
     }
 
     /// Bind the given `provider` to the corresponding `name`.
-    pub async fn set_named_provider<T: FeatureProvider>(&mut self, name: &str, provider: T) {
-        self.provider_registry.set_named(name, provider).await;
+    ///
+    /// This function initializes the provider and returns the initialization result. Even when
+    /// initialization fails, the provider stays registered (in `Error` status), so the returned
+    /// error may safely be ignored — discard it explicitly with `.ok()` to avoid the
+    /// `unused_must_use` warning.
+    pub async fn set_named_provider<T: FeatureProvider>(
+        &mut self,
+        name: &str,
+        provider: T,
+    ) -> Result<(), EvaluationError> {
+        self.provider_registry.set_named(name, provider).await
     }
 
     /// Add a new hook to the global list of hooks.
     pub async fn add_hook<T: Hook>(&mut self, hook: T) {
         let mut lock = self.hooks.get_mut().await;
         lock.push(HookWrapper::new(hook));
+    }
+
+    /// Register an API-level `handler` that runs whenever any provider emits an event of the
+    /// given `event_type`.
+    ///
+    /// If the default provider is already in the state associated with `event_type`, the handler
+    /// runs immediately.
+    ///
+    /// The returned id can be passed to [`OpenFeature::remove_handler`] to unregister the
+    /// handler.
+    pub async fn add_handler<F>(&self, event_type: ProviderEventType, handler: F) -> EventHandlerId
+    where
+        F: Fn(&EventDetails) + Send + Sync + 'static,
+    {
+        self.events
+            .add_handler(None, event_type, Arc::new(handler))
+            .await
+    }
+
+    /// Remove the event handler registered under the given `id`, if any.
+    pub async fn remove_handler(&self, id: EventHandlerId) {
+        self.events.remove_handler(id).await;
+    }
+
+    /// Return the status of the default (unnamed) provider, as tracked by the SDK.
+    pub async fn provider_status(&self) -> ProviderStatus {
+        self.events.provider_status("").await
+    }
+
+    /// Return the status of the provider bound to the given `name`, as tracked by the SDK.
+    /// Falls back to the default provider's status if no provider is bound to `name`.
+    pub async fn named_provider_status(&self, name: &str) -> ProviderStatus {
+        self.events.provider_status(name).await
     }
 
     /// Return the metadata of default (unnamed) provider.
@@ -89,6 +165,7 @@ impl OpenFeature {
             String::default(),
             self.evaluation_context.clone(),
             self.hooks.clone(),
+            self.events.clone(),
             self.provider_registry.clone(),
         )
     }
@@ -100,6 +177,7 @@ impl OpenFeature {
             name.to_string(),
             self.evaluation_context.clone(),
             self.hooks.clone(),
+            self.events.clone(),
             self.provider_registry.clone(),
         )
     }
@@ -136,7 +214,8 @@ mod tests {
             OpenFeature::singleton_mut()
                 .await
                 .set_provider(NoOpProvider::default())
-                .await;
+                .await
+                .ok();
         });
 
         let reader2 = tokio::spawn(async move {
@@ -168,7 +247,8 @@ mod tests {
 
         // Set the new provider and ensure the value comes from it.
         let mut provider = MockFeatureProvider::new();
-        provider.expect_initialize().returning(|_| {});
+        provider.expect_initialize().returning(|_| Ok(()));
+        provider.expect_attach_emitter().return_const(());
         provider.expect_hooks().return_const(vec![]);
         provider
             .expect_metadata()
@@ -177,7 +257,7 @@ mod tests {
             .expect_resolve_int_value()
             .return_const(Ok(ResolutionDetails::new(200)));
 
-        api.set_provider(provider).await;
+        api.set_provider(provider).await.ok();
 
         assert_eq!(
             client.get_int_value("some-key", None, None).await.unwrap(),
@@ -192,10 +272,14 @@ mod tests {
     #[tokio::test]
     async fn set_provider_invoke_initialize() {
         let mut provider = MockFeatureProvider::new();
-        provider.expect_initialize().returning(|_| {}).once();
+        provider.expect_initialize().returning(|_| Ok(())).once();
+        provider.expect_attach_emitter().return_const(());
+        provider
+            .expect_metadata()
+            .return_const(ProviderMetadata::default());
 
         let mut api = OpenFeature::default();
-        api.set_provider(provider).await;
+        api.set_provider(provider).await.ok();
     }
 
     #[spec(
@@ -219,7 +303,8 @@ mod tests {
 
         // Bind provider to the same name.
         let mut provider = MockFeatureProvider::new();
-        provider.expect_initialize().returning(|_| {});
+        provider.expect_initialize().returning(|_| Ok(()));
+        provider.expect_attach_emitter().return_const(());
         provider.expect_hooks().return_const(vec![]);
         provider
             .expect_metadata()
@@ -227,7 +312,7 @@ mod tests {
         provider
             .expect_resolve_int_value()
             .return_const(Ok(ResolutionDetails::new(30)));
-        api.set_named_provider("test", provider).await;
+        api.set_named_provider("test", provider).await.ok();
 
         // Ensure the new provider is used for existing clients.
         assert_eq!(client.get_int_value("", None, None).await, Ok(30));
@@ -244,9 +329,10 @@ mod tests {
     #[tokio::test]
     async fn provider_metadata() {
         let mut api = OpenFeature::default();
-        api.set_provider(NoOpProvider::default()).await;
+        api.set_provider(NoOpProvider::default()).await.ok();
         api.set_named_provider("test", NoOpProvider::default())
-            .await;
+            .await
+            .ok();
 
         assert_eq!(api.provider_metadata().await.name, "No-op Provider");
         assert_eq!(
@@ -266,7 +352,8 @@ mod tests {
         let mut api = OpenFeature::default();
 
         let mut default_provider = MockFeatureProvider::new();
-        default_provider.expect_initialize().returning(|_| {});
+        default_provider.expect_initialize().returning(|_| Ok(()));
+        default_provider.expect_attach_emitter().return_const(());
         default_provider.expect_hooks().return_const(vec![]);
         default_provider
             .expect_metadata()
@@ -276,7 +363,8 @@ mod tests {
             .return_const(Ok(ResolutionDetails::new(100)));
 
         let mut named_provider = MockFeatureProvider::new();
-        named_provider.expect_initialize().returning(|_| {});
+        named_provider.expect_initialize().returning(|_| Ok(()));
+        named_provider.expect_attach_emitter().return_const(());
         named_provider.expect_hooks().return_const(vec![]);
         named_provider
             .expect_metadata()
@@ -285,8 +373,8 @@ mod tests {
             .expect_resolve_int_value()
             .return_const(Ok(ResolutionDetails::new(200)));
 
-        api.set_provider(default_provider).await;
-        api.set_named_provider("test", named_provider).await;
+        api.set_provider(default_provider).await.ok();
+        api.set_named_provider("test", named_provider).await.ok();
 
         let client = api.create_client();
         assert_eq!(client.get_int_value("key", None, None).await.unwrap(), 100);
@@ -312,10 +400,11 @@ mod tests {
     #[tokio::test]
     async fn set_provider_should_block() {
         let mut api = OpenFeature::default();
-        api.set_provider(NoOpProvider::default()).await;
+        api.set_provider(NoOpProvider::default()).await.ok();
 
         api.set_named_provider("named", NoOpProvider::default())
-            .await;
+            .await
+            .ok();
     }
 
     #[spec(
@@ -325,7 +414,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown() {
         let mut api = OpenFeature::default();
-        api.set_provider(NoOpProvider::default()).await;
+        api.set_provider(NoOpProvider::default()).await.ok();
 
         api.shutdown().await;
     }
@@ -342,7 +431,8 @@ mod tests {
     async fn evaluation_context() {
         // Setup expectations for different evaluation contexts.
         let mut provider = MockFeatureProvider::new();
-        provider.expect_initialize().returning(|_| {});
+        provider.expect_initialize().returning(|_| Ok(()));
+        provider.expect_attach_emitter().return_const(());
         provider.expect_hooks().return_const(vec![]);
         provider
             .expect_metadata()
@@ -386,7 +476,7 @@ mod tests {
 
         // Register the provider.
         let mut api = OpenFeature::default();
-        api.set_provider(provider).await;
+        api.set_provider(provider).await.ok();
 
         // Set global client context and ensure its values are picked up.
         let global_evaluation_context = EvaluationContext::default()
@@ -446,7 +536,7 @@ mod tests {
         let mut api = OpenFeature::singleton_mut().await;
 
         // Set the default (unnamed) provider.
-        api.set_provider(NoOpProvider::default()).await;
+        api.set_provider(NoOpProvider::default()).await.ok();
 
         // Create an unnamed client.
         let client = api.create_client();
@@ -457,7 +547,7 @@ mod tests {
             .with_targeting_key("Targeting")
             .with_custom_field("bool_key", true)
             .with_custom_field("int_key", 100)
-            .with_custom_field("float_key", 3.14)
+            .with_custom_field("float_key", 3.5)
             .with_custom_field("string_key", "Hello".to_string())
             .with_custom_field("datetime_key", time::OffsetDateTime::now_utc())
             .with_custom_field(

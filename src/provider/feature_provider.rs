@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use crate::{EvaluationContext, EvaluationResult, StructValue};
+use crate::{EvaluationContext, EvaluationError, EvaluationResult, EventEmitter, StructValue};
 
 use super::ResolutionDetails;
 
@@ -34,13 +34,37 @@ pub trait FeatureProvider: Send + Sync + 'static {
     /// abnormally.
     /// * The provider SHOULD indicate an error if flag resolution is attempted before the provider
     /// is ready.
-    #[allow(unused_variables)]
-    async fn initialize(&mut self, context: &EvaluationContext) {}
-
-    /// The provider MAY define a status field/accessor which indicates the readiness of the
-    /// provider, with possible values NOT_READY, READY, or ERROR.
     ///
-    /// Providers without this field can be assumed to be ready immediately.
+    /// If this function returns an error, the SDK runs the registered `PROVIDER_ERROR` handlers
+    /// and marks the provider [`ProviderStatus::Fatal`] when the error carries the
+    /// [`crate::EvaluationErrorCode::ProviderFatal`] code, or [`ProviderStatus::Error`]
+    /// otherwise. On success the provider is marked [`ProviderStatus::Ready`] and the
+    /// `PROVIDER_READY` handlers run.
+    #[allow(unused_variables)]
+    async fn initialize(&mut self, context: &EvaluationContext) -> Result<(), EvaluationError> {
+        Ok(())
+    }
+
+    /// Called by the SDK right before [`FeatureProvider::initialize`] to hand the provider an
+    /// [`EventEmitter`].
+    ///
+    /// Providers that emit events (`PROVIDER_CONFIGURATION_CHANGED`, `PROVIDER_STALE`, ...)
+    /// should store the emitter and use it to signal state changes to the SDK. The default
+    /// implementation discards the emitter.
+    #[allow(unused_variables)]
+    fn attach_emitter(&mut self, emitter: EventEmitter) {}
+
+    /// The readiness of the provider, as reported by the provider itself.
+    ///
+    /// **Deprecated.** The SDK derives provider status from the events a provider emits and
+    /// never calls this method, so overriding it has no effect. Read the authoritative status
+    /// via [`crate::OpenFeature::provider_status`],
+    /// [`crate::OpenFeature::named_provider_status`] or [`crate::Client::provider_status`].
+    /// This method is retained only for backwards compatibility and will be removed in a future
+    /// release.
+    ///
+    /// (A `#[deprecated]` attribute cannot be used here: `mockall::automock` propagates it into
+    /// generated code where the attribute is not permitted.)
     fn status(&self) -> ProviderStatus {
         ProviderStatus::Ready
     }
@@ -114,7 +138,7 @@ impl ProviderMetadata {
 // ============================================================
 
 /// The status of a feature provider.
-#[derive(Default, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Hash, Debug)]
 pub enum ProviderStatus {
     /// The provider has not been initialized.
     #[default]
@@ -128,5 +152,8 @@ pub enum ProviderStatus {
 
     /// The provider's cached state is no longer valid and may not be up-to-date with the source of
     /// truth.
-    STALE,
+    Stale,
+
+    /// The provider has entered an irrecoverable error state.
+    Fatal,
 }

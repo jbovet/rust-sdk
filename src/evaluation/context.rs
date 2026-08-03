@@ -172,7 +172,7 @@ mod tests {
             .with_targeting_key("Key")
             .with_custom_field("Bool", true)
             .with_custom_field("Int", 100)
-            .with_custom_field("Float", 3.14)
+            .with_custom_field("Float", 3.5)
             .with_custom_field("String", "Hello")
             .with_custom_field("Datetime", now_time)
             .with_custom_field(
@@ -187,7 +187,7 @@ mod tests {
         );
         assert_eq!(
             context.custom_fields.get("Float"),
-            Some(&EvaluationContextFieldValue::Float(3.14))
+            Some(&EvaluationContextFieldValue::Float(3.5))
         );
         assert_eq!(
             context.custom_fields.get("String"),

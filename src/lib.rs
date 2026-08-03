@@ -21,9 +21,17 @@ pub use api::*;
 mod evaluation;
 pub use evaluation::*;
 
+/// Provider events related.
+mod events;
+pub use events::*;
+
 /// Hooks related.
 mod hooks;
 pub use hooks::*;
+
+/// Tracking related.
+mod tracking;
+pub use tracking::*;
 
 /// Feature provider related.
 pub mod provider;

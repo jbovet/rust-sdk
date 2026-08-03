@@ -136,7 +136,7 @@ async fn main() {
         .init();
 
     let mut api = OpenFeature::singleton_mut().await;
-    api.set_provider(DummyProvider::default()).await;
+    api.set_provider(DummyProvider::default()).await.ok();
     api.add_hook(DummyLoggingHook("global".to_string())).await;
     drop(api);
 

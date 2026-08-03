@@ -1,14 +1,15 @@
 use std::{future::Future, pin::Pin, sync::Arc};
 
 use crate::{
-    provider::{FeatureProvider, ResolutionDetails},
+    provider::{FeatureProvider, ProviderStatus, ResolutionDetails},
     EvaluationContext, EvaluationDetails, EvaluationError, EvaluationErrorCode, EvaluationOptions,
-    EvaluationResult, Hook, HookContext, HookHints, HookWrapper, StructValue, Value,
+    EvaluationResult, EventDetails, EventHandlerId, Hook, HookContext, HookHints, HookWrapper,
+    ProviderEventType, StructValue, TrackingEventDetails, Value,
 };
 
 use super::{
-    global_evaluation_context::GlobalEvaluationContext, global_hooks::GlobalHooks,
-    provider_registry::ProviderRegistry,
+    event_registry::EventRegistry, global_evaluation_context::GlobalEvaluationContext,
+    global_hooks::GlobalHooks, provider_registry::ProviderRegistry,
 };
 
 /// The metadata of OpenFeature client.
@@ -19,7 +20,7 @@ pub struct ClientMetadata {
 }
 
 /// The OpenFeature client.
-/// Create it through the [`OpenFeature`] struct.
+/// Create it through the [`crate::OpenFeature`] struct.
 #[allow(clippy::struct_field_names)]
 pub struct Client {
     metadata: ClientMetadata,
@@ -27,22 +28,25 @@ pub struct Client {
     evaluation_context: EvaluationContext,
     global_evaluation_context: GlobalEvaluationContext,
     global_hooks: GlobalHooks,
+    events: EventRegistry,
 
     client_hooks: Vec<HookWrapper>,
 }
 
 impl Client {
     /// Create a new [`Client`] instance.
-    pub fn new(
+    pub(crate) fn new(
         name: impl Into<String>,
         global_evaluation_context: GlobalEvaluationContext,
         global_hooks: GlobalHooks,
+        events: EventRegistry,
         provider_registry: ProviderRegistry,
     ) -> Self {
         Self {
             metadata: ClientMetadata { name: name.into() },
             global_evaluation_context,
             global_hooks,
+            events,
             provider_registry,
             evaluation_context: EvaluationContext::default(),
             client_hooks: Vec::new(),
@@ -54,9 +58,61 @@ impl Client {
         &self.metadata
     }
 
+    /// Register a `handler` that runs whenever the provider associated with this client emits an
+    /// event of the given `event_type`.
+    ///
+    /// If the associated provider is already in the state corresponding to `event_type`, the
+    /// handler runs immediately.
+    ///
+    /// Note that event handlers are shared between all clients created with the same name, and
+    /// they outlive the client itself (unregister them with [`Client::remove_handler`]).
+    pub async fn add_handler<F>(&self, event_type: ProviderEventType, handler: F) -> EventHandlerId
+    where
+        F: Fn(&EventDetails) + Send + Sync + 'static,
+    {
+        self.events
+            .add_handler(
+                Some(self.metadata.name.clone()),
+                event_type,
+                Arc::new(handler),
+            )
+            .await
+    }
+
+    /// Remove the event handler registered under the given `id`, if any.
+    pub async fn remove_handler(&self, id: EventHandlerId) {
+        self.events.remove_handler(id).await;
+    }
+
+    /// Return the status of the provider associated with this client, as tracked by the SDK.
+    pub async fn provider_status(&self) -> ProviderStatus {
+        self.events.provider_status(&self.metadata.name).await
+    }
+
     /// Set evaluation context to the client.
     pub fn set_evaluation_context(&mut self, evaluation_context: EvaluationContext) {
         self.evaluation_context = evaluation_context;
+    }
+
+    /// Track a user action, associating it with the given `event_name` and optional tracking
+    /// `details` (spec 6.1.1).
+    ///
+    /// The provided `context` is merged with the client and global evaluation contexts (with the
+    /// same precedence as flag evaluation) before being handed to the provider. This is a
+    /// fire-and-forget operation and returns no value; providers that do not support tracking
+    /// ignore it.
+    pub async fn track(
+        &self,
+        event_name: &str,
+        context: Option<&EvaluationContext>,
+        details: Option<TrackingEventDetails>,
+    ) {
+        let context = self.merge_evaluation_context(context).await;
+        let details = details.unwrap_or_default();
+
+        self.get_provider()
+            .await
+            .track(event_name, &context, &details);
     }
 
     /// Evaluate given `flag_key` with corresponding `evaluation_context` and `evaluation_options`
@@ -534,11 +590,14 @@ mod tests {
 
     use crate::{
         api::{
-            global_evaluation_context::GlobalEvaluationContext, global_hooks::GlobalHooks,
-            provider_registry::ProviderRegistry,
+            event_registry::EventRegistry, global_evaluation_context::GlobalEvaluationContext,
+            global_hooks::GlobalHooks, provider_registry::ProviderRegistry,
         },
-        provider::{FeatureProvider, MockFeatureProvider, ProviderMetadata, ResolutionDetails},
-        Client, EvaluationReason, FlagMetadata, StructValue, Value,
+        provider::{
+            FeatureProvider, MockFeatureProvider, NoOpProvider, ProviderMetadata, ResolutionDetails,
+        },
+        Client, EvaluationContext, EvaluationReason, FlagMetadata, StructValue,
+        TrackingEventDetails, Value,
     };
 
     #[spec(
@@ -590,7 +649,8 @@ mod tests {
     async fn get_value() {
         // Test bool.
         let mut provider = MockFeatureProvider::new();
-        provider.expect_initialize().returning(|_| {});
+        provider.expect_initialize().returning(|_| Ok(()));
+        provider.expect_attach_emitter().return_const(());
         provider.expect_hooks().return_const(vec![]);
         provider
             .expect_metadata()
@@ -694,7 +754,8 @@ mod tests {
     #[tokio::test]
     async fn get_details() {
         let mut provider = MockFeatureProvider::new();
-        provider.expect_initialize().returning(|_| {});
+        provider.expect_initialize().returning(|_| Ok(()));
+        provider.expect_attach_emitter().return_const(());
         provider.expect_hooks().return_const(vec![]);
         provider
             .expect_metadata()
@@ -750,7 +811,8 @@ mod tests {
     #[tokio::test]
     async fn get_details_flag_metadata() {
         let mut provider = MockFeatureProvider::new();
-        provider.expect_initialize().returning(|_| {});
+        provider.expect_initialize().returning(|_| Ok(()));
+        provider.expect_attach_emitter().return_const(());
         provider.expect_hooks().return_const(vec![]);
         provider
             .expect_metadata()
@@ -786,7 +848,11 @@ mod tests {
     #[tokio::test]
     async fn with_hook() {
         let mut provider = MockFeatureProvider::new();
-        provider.expect_initialize().returning(|_| {});
+        provider.expect_initialize().returning(|_| Ok(()));
+        provider.expect_attach_emitter().return_const(());
+        provider
+            .expect_metadata()
+            .return_const(ProviderMetadata::default());
 
         let client = create_client(provider).await;
 
@@ -798,7 +864,11 @@ mod tests {
     #[tokio::test]
     async fn with_logging_hook() {
         let mut provider = MockFeatureProvider::new();
-        provider.expect_initialize().returning(|_| {});
+        provider.expect_initialize().returning(|_| Ok(()));
+        provider.expect_attach_emitter().return_const(());
+        provider
+            .expect_metadata()
+            .return_const(ProviderMetadata::default());
 
         let client = create_client(provider).await;
 
@@ -807,23 +877,101 @@ mod tests {
         assert_eq!(client.client_hooks.len(), 1);
     }
 
+    #[spec(
+        number = "6.1.1.1",
+        text = "The client MUST define a function for tracking the occurrence of a particular action or application state, with parameters tracking event name (string, required), evaluation context (optional) and tracking event details (optional), which returns nothing."
+    )]
+    #[spec(
+        number = "6.1.3",
+        text = "The evaluation context passed to the provider's track function MUST be merged in the order: API (global; lowest precedence) -> transaction -> client -> invocation (highest precedence), with duplicate values being overwritten."
+    )]
+    #[tokio::test]
+    async fn track_forwards_merged_context_and_details_to_provider() {
+        let mut provider = MockFeatureProvider::new();
+        provider.expect_initialize().returning(|_| Ok(()));
+        provider.expect_attach_emitter().return_const(());
+        provider
+            .expect_metadata()
+            .return_const(ProviderMetadata::default());
+
+        provider
+            .expect_track()
+            .withf(|event_name, context, details| {
+                event_name == "checkout"
+                    // The invocation-level field is present ...
+                    && context.custom_fields.contains_key("invocation_field")
+                    // ... merged with the client-level field (spec 6.1.3).
+                    && context.custom_fields.contains_key("client_field")
+                    && details.value == Some(49.99)
+            })
+            .times(1)
+            .return_const(());
+
+        let mut client = create_client(provider).await;
+        client.set_evaluation_context(
+            EvaluationContext::default().with_custom_field("client_field", "client"),
+        );
+
+        let invocation =
+            EvaluationContext::default().with_custom_field("invocation_field", "invocation");
+        let details = TrackingEventDetails::builder().value(49.99).build();
+
+        client
+            .track("checkout", Some(&invocation), Some(details))
+            .await;
+    }
+
+    // The Rust SDK is dynamic-context, so the static-context tracking variant does not apply.
+    #[spec(
+        number = "6.1.2.1",
+        text = "The client MUST define a function for tracking the occurrence of a particular action or application state, with parameters tracking event name (string, required) and tracking event details (optional), which returns nothing."
+    )]
+    #[test]
+    fn static_context_tracking_not_applicable() {}
+
+    #[spec(
+        number = "6.1.4",
+        text = "If the client's track function is called and the associated provider does not implement tracking, the client's track function MUST no-op."
+    )]
+    #[tokio::test]
+    async fn track_is_noop_when_provider_does_not_implement_tracking() {
+        // `NoOpProvider` does not override `track`, so it uses the default no-op implementation.
+        let client = create_client(NoOpProvider::default()).await;
+
+        // The call must complete without panicking and without any effect.
+        client
+            .track(
+                "checkout",
+                None,
+                Some(TrackingEventDetails::builder().value(1.0).build()),
+            )
+            .await;
+    }
+
     fn create_default_client() -> Client {
+        let evaluation_context = GlobalEvaluationContext::default();
+        let events = EventRegistry::default();
+
         Client::new(
             "no_op",
-            GlobalEvaluationContext::default(),
+            evaluation_context.clone(),
             GlobalHooks::default(),
-            ProviderRegistry::default(),
+            events.clone(),
+            ProviderRegistry::new(evaluation_context, events),
         )
     }
 
     async fn create_client(provider: impl FeatureProvider) -> Client {
-        let provider_registry = ProviderRegistry::default();
-        provider_registry.set_named("custom", provider).await;
+        let evaluation_context = GlobalEvaluationContext::default();
+        let events = EventRegistry::default();
+        let provider_registry = ProviderRegistry::new(evaluation_context.clone(), events.clone());
+        provider_registry.set_named("custom", provider).await.ok();
 
         Client::new(
             "custom",
-            GlobalEvaluationContext::default(),
+            evaluation_context,
             GlobalHooks::default(),
+            events,
             provider_registry,
         )
     }

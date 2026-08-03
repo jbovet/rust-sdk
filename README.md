@@ -157,6 +157,7 @@ See [here](https://docs.rs/open-feature/latest/open_feature/index.html) for the 
 | ✅      | [Logging](#logging)             | Integrate with popular logging packages.                                                                                           |
 | ✅      | [Named clients](#named-clients) | Utilize multiple providers in a single application.                                                                                |
 | ✅      | [Eventing](#eventing)           | React to state changes in the provider or flag management system.                                                                  |
+| ✅      | [Tracking](#tracking)           | Associate user actions with feature flag evaluations.                                                                              |
 | ✅      | [Shutdown](#shutdown)           | Gracefully clean up a provider during application shutdown.                                                                        |
 | ✅      | [Extending](#extending)         | Extend OpenFeature with custom providers and hooks.                                                                                |
 
@@ -349,6 +350,28 @@ client
 The SDK also tracks the status of each provider based on its initialization outcome and emitted events; query it with `api.provider_status()`, `api.named_provider_status(name)` or `client.provider_status()`.
 
 Providers emit events through the `EventEmitter` handle passed to them via `FeatureProvider::attach_emitter` right before initialization — see [`examples/events.rs`](examples/events.rs) for a complete provider that emits events.
+
+### Tracking
+
+Tracking lets you associate user actions (such as a conversion) with feature flag evaluations, so an experimentation or analytics backend can measure the impact of a flag.
+It is a fire-and-forget operation: `Client::track` accepts a required event name, an optional evaluation context (merged with the client and global context, like flag evaluation), and optional `TrackingEventDetails`.
+
+```rust
+use open_feature::{EvaluationContext, TrackingEventDetails};
+
+let context = EvaluationContext::default().with_targeting_key("user-123");
+let details = TrackingEventDetails::builder()
+    .value(49.99) // an optional scalar amount, e.g. the value of a purchase
+    .build()
+    .with_field("currency", "USD"); // arbitrary custom fields
+
+client
+    .track("checkout-completed", Some(&context), Some(details))
+    .await;
+```
+
+Whether a tracking event has any effect depends on the provider: a provider records tracking events by overriding `FeatureProvider::track` (the default implementation is a no-op).
+See [`examples/tracking.rs`](examples/tracking.rs) for a complete example.
 
 ### Shutdown
 

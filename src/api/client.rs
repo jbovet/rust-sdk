@@ -4,7 +4,7 @@ use crate::{
     provider::{FeatureProvider, ProviderStatus, ResolutionDetails},
     EvaluationContext, EvaluationDetails, EvaluationError, EvaluationErrorCode, EvaluationOptions,
     EvaluationResult, EventDetails, EventHandlerId, Hook, HookContext, HookHints, HookWrapper,
-    ProviderEventType, StructValue, Value,
+    ProviderEventType, StructValue, TrackingEventDetails, Value,
 };
 
 use super::{
@@ -92,6 +92,27 @@ impl Client {
     /// Set evaluation context to the client.
     pub fn set_evaluation_context(&mut self, evaluation_context: EvaluationContext) {
         self.evaluation_context = evaluation_context;
+    }
+
+    /// Track a user action, associating it with the given `event_name` and optional tracking
+    /// `details` (spec 6.1.1).
+    ///
+    /// The provided `context` is merged with the client and global evaluation contexts (with the
+    /// same precedence as flag evaluation) before being handed to the provider. This is a
+    /// fire-and-forget operation and returns no value; providers that do not support tracking
+    /// ignore it.
+    pub async fn track(
+        &self,
+        event_name: &str,
+        context: Option<&EvaluationContext>,
+        details: Option<TrackingEventDetails>,
+    ) {
+        let context = self.merge_evaluation_context(context).await;
+        let details = details.unwrap_or_default();
+
+        self.get_provider()
+            .await
+            .track(event_name, &context, &details);
     }
 
     /// Evaluate given `flag_key` with corresponding `evaluation_context` and `evaluation_options`
@@ -572,8 +593,11 @@ mod tests {
             event_registry::EventRegistry, global_evaluation_context::GlobalEvaluationContext,
             global_hooks::GlobalHooks, provider_registry::ProviderRegistry,
         },
-        provider::{FeatureProvider, MockFeatureProvider, ProviderMetadata, ResolutionDetails},
-        Client, EvaluationReason, FlagMetadata, StructValue, Value,
+        provider::{
+            FeatureProvider, MockFeatureProvider, NoOpProvider, ProviderMetadata, ResolutionDetails,
+        },
+        Client, EvaluationContext, EvaluationReason, FlagMetadata, StructValue,
+        TrackingEventDetails, Value,
     };
 
     #[spec(
@@ -851,6 +875,77 @@ mod tests {
         let client = client.with_logging_hook(false);
 
         assert_eq!(client.client_hooks.len(), 1);
+    }
+
+    #[spec(
+        number = "6.1.1.1",
+        text = "The client MUST define a function for tracking the occurrence of a particular action or application state, with parameters tracking event name (string, required), evaluation context (optional) and tracking event details (optional), which returns nothing."
+    )]
+    #[spec(
+        number = "6.1.3",
+        text = "The evaluation context passed to the provider's track function MUST be merged in the order: API (global; lowest precedence) -> transaction -> client -> invocation (highest precedence), with duplicate values being overwritten."
+    )]
+    #[tokio::test]
+    async fn track_forwards_merged_context_and_details_to_provider() {
+        let mut provider = MockFeatureProvider::new();
+        provider.expect_initialize().returning(|_| Ok(()));
+        provider.expect_attach_emitter().return_const(());
+        provider
+            .expect_metadata()
+            .return_const(ProviderMetadata::default());
+
+        provider
+            .expect_track()
+            .withf(|event_name, context, details| {
+                event_name == "checkout"
+                    // The invocation-level field is present ...
+                    && context.custom_fields.contains_key("invocation_field")
+                    // ... merged with the client-level field (spec 6.1.3).
+                    && context.custom_fields.contains_key("client_field")
+                    && details.value == Some(49.99)
+            })
+            .times(1)
+            .return_const(());
+
+        let mut client = create_client(provider).await;
+        client.set_evaluation_context(
+            EvaluationContext::default().with_custom_field("client_field", "client"),
+        );
+
+        let invocation =
+            EvaluationContext::default().with_custom_field("invocation_field", "invocation");
+        let details = TrackingEventDetails::builder().value(49.99).build();
+
+        client
+            .track("checkout", Some(&invocation), Some(details))
+            .await;
+    }
+
+    // The Rust SDK is dynamic-context, so the static-context tracking variant does not apply.
+    #[spec(
+        number = "6.1.2.1",
+        text = "The client MUST define a function for tracking the occurrence of a particular action or application state, with parameters tracking event name (string, required) and tracking event details (optional), which returns nothing."
+    )]
+    #[test]
+    fn static_context_tracking_not_applicable() {}
+
+    #[spec(
+        number = "6.1.4",
+        text = "If the client's track function is called and the associated provider does not implement tracking, the client's track function MUST no-op."
+    )]
+    #[tokio::test]
+    async fn track_is_noop_when_provider_does_not_implement_tracking() {
+        // `NoOpProvider` does not override `track`, so it uses the default no-op implementation.
+        let client = create_client(NoOpProvider::default()).await;
+
+        // The call must complete without panicking and without any effect.
+        client
+            .track(
+                "checkout",
+                None,
+                Some(TrackingEventDetails::builder().value(1.0).build()),
+            )
+            .await;
     }
 
     fn create_default_client() -> Client {

@@ -1,14 +1,15 @@
 use std::{future::Future, pin::Pin, sync::Arc};
 
 use crate::{
-    provider::{FeatureProvider, ResolutionDetails},
+    provider::{FeatureProvider, ProviderStatus, ResolutionDetails},
     EvaluationContext, EvaluationDetails, EvaluationError, EvaluationErrorCode, EvaluationOptions,
-    EvaluationResult, Hook, HookContext, HookHints, HookWrapper, StructValue, Value,
+    EvaluationResult, EventDetails, EventHandlerId, Hook, HookContext, HookHints, HookWrapper,
+    ProviderEventType, StructValue, Value,
 };
 
 use super::{
-    global_evaluation_context::GlobalEvaluationContext, global_hooks::GlobalHooks,
-    provider_registry::ProviderRegistry,
+    event_registry::EventRegistry, global_evaluation_context::GlobalEvaluationContext,
+    global_hooks::GlobalHooks, provider_registry::ProviderRegistry,
 };
 
 /// The metadata of OpenFeature client.
@@ -19,7 +20,7 @@ pub struct ClientMetadata {
 }
 
 /// The OpenFeature client.
-/// Create it through the [`OpenFeature`] struct.
+/// Create it through the [`crate::OpenFeature`] struct.
 #[allow(clippy::struct_field_names)]
 pub struct Client {
     metadata: ClientMetadata,
@@ -27,22 +28,25 @@ pub struct Client {
     evaluation_context: EvaluationContext,
     global_evaluation_context: GlobalEvaluationContext,
     global_hooks: GlobalHooks,
+    events: EventRegistry,
 
     client_hooks: Vec<HookWrapper>,
 }
 
 impl Client {
     /// Create a new [`Client`] instance.
-    pub fn new(
+    pub(crate) fn new(
         name: impl Into<String>,
         global_evaluation_context: GlobalEvaluationContext,
         global_hooks: GlobalHooks,
+        events: EventRegistry,
         provider_registry: ProviderRegistry,
     ) -> Self {
         Self {
             metadata: ClientMetadata { name: name.into() },
             global_evaluation_context,
             global_hooks,
+            events,
             provider_registry,
             evaluation_context: EvaluationContext::default(),
             client_hooks: Vec::new(),
@@ -52,6 +56,37 @@ impl Client {
     /// Return the metadata of current client.
     pub fn metadata(&self) -> &ClientMetadata {
         &self.metadata
+    }
+
+    /// Register a `handler` that runs whenever the provider associated with this client emits an
+    /// event of the given `event_type`.
+    ///
+    /// If the associated provider is already in the state corresponding to `event_type`, the
+    /// handler runs immediately.
+    ///
+    /// Note that event handlers are shared between all clients created with the same name, and
+    /// they outlive the client itself (unregister them with [`Client::remove_handler`]).
+    pub async fn add_handler<F>(&self, event_type: ProviderEventType, handler: F) -> EventHandlerId
+    where
+        F: Fn(&EventDetails) + Send + Sync + 'static,
+    {
+        self.events
+            .add_handler(
+                Some(self.metadata.name.clone()),
+                event_type,
+                Arc::new(handler),
+            )
+            .await
+    }
+
+    /// Remove the event handler registered under the given `id`, if any.
+    pub async fn remove_handler(&self, id: EventHandlerId) {
+        self.events.remove_handler(id).await;
+    }
+
+    /// Return the status of the provider associated with this client, as tracked by the SDK.
+    pub async fn provider_status(&self) -> ProviderStatus {
+        self.events.provider_status(&self.metadata.name).await
     }
 
     /// Set evaluation context to the client.
@@ -534,8 +569,8 @@ mod tests {
 
     use crate::{
         api::{
-            global_evaluation_context::GlobalEvaluationContext, global_hooks::GlobalHooks,
-            provider_registry::ProviderRegistry,
+            event_registry::EventRegistry, global_evaluation_context::GlobalEvaluationContext,
+            global_hooks::GlobalHooks, provider_registry::ProviderRegistry,
         },
         provider::{FeatureProvider, MockFeatureProvider, ProviderMetadata, ResolutionDetails},
         Client, EvaluationReason, FlagMetadata, StructValue, Value,
@@ -590,7 +625,8 @@ mod tests {
     async fn get_value() {
         // Test bool.
         let mut provider = MockFeatureProvider::new();
-        provider.expect_initialize().returning(|_| {});
+        provider.expect_initialize().returning(|_| Ok(()));
+        provider.expect_attach_emitter().return_const(());
         provider.expect_hooks().return_const(vec![]);
         provider
             .expect_metadata()
@@ -694,7 +730,8 @@ mod tests {
     #[tokio::test]
     async fn get_details() {
         let mut provider = MockFeatureProvider::new();
-        provider.expect_initialize().returning(|_| {});
+        provider.expect_initialize().returning(|_| Ok(()));
+        provider.expect_attach_emitter().return_const(());
         provider.expect_hooks().return_const(vec![]);
         provider
             .expect_metadata()
@@ -750,7 +787,8 @@ mod tests {
     #[tokio::test]
     async fn get_details_flag_metadata() {
         let mut provider = MockFeatureProvider::new();
-        provider.expect_initialize().returning(|_| {});
+        provider.expect_initialize().returning(|_| Ok(()));
+        provider.expect_attach_emitter().return_const(());
         provider.expect_hooks().return_const(vec![]);
         provider
             .expect_metadata()
@@ -786,7 +824,11 @@ mod tests {
     #[tokio::test]
     async fn with_hook() {
         let mut provider = MockFeatureProvider::new();
-        provider.expect_initialize().returning(|_| {});
+        provider.expect_initialize().returning(|_| Ok(()));
+        provider.expect_attach_emitter().return_const(());
+        provider
+            .expect_metadata()
+            .return_const(ProviderMetadata::default());
 
         let client = create_client(provider).await;
 
@@ -798,7 +840,11 @@ mod tests {
     #[tokio::test]
     async fn with_logging_hook() {
         let mut provider = MockFeatureProvider::new();
-        provider.expect_initialize().returning(|_| {});
+        provider.expect_initialize().returning(|_| Ok(()));
+        provider.expect_attach_emitter().return_const(());
+        provider
+            .expect_metadata()
+            .return_const(ProviderMetadata::default());
 
         let client = create_client(provider).await;
 
@@ -808,22 +854,29 @@ mod tests {
     }
 
     fn create_default_client() -> Client {
+        let evaluation_context = GlobalEvaluationContext::default();
+        let events = EventRegistry::default();
+
         Client::new(
             "no_op",
-            GlobalEvaluationContext::default(),
+            evaluation_context.clone(),
             GlobalHooks::default(),
-            ProviderRegistry::default(),
+            events.clone(),
+            ProviderRegistry::new(evaluation_context, events),
         )
     }
 
     async fn create_client(provider: impl FeatureProvider) -> Client {
-        let provider_registry = ProviderRegistry::default();
-        provider_registry.set_named("custom", provider).await;
+        let evaluation_context = GlobalEvaluationContext::default();
+        let events = EventRegistry::default();
+        let provider_registry = ProviderRegistry::new(evaluation_context.clone(), events.clone());
+        provider_registry.set_named("custom", provider).await.ok();
 
         Client::new(
             "custom",
-            GlobalEvaluationContext::default(),
+            evaluation_context,
             GlobalHooks::default(),
+            events,
             provider_registry,
         )
     }

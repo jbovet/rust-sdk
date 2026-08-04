@@ -342,19 +342,14 @@ impl Client {
         let hook_data: Vec<HookData> = ordered_hooks.iter().map(|_| HookData::default()).collect();
 
         // INFO: (hook, its data) in before order: API(global), Client, Invocation, Provider
-        let before_hooks: Vec<(&HookWrapper, &HookData)> = ordered_hooks
-            .iter()
-            .copied()
-            .zip(hook_data.iter())
-            .collect();
+        let before_hooks = || ordered_hooks.iter().copied().zip(hook_data.iter());
 
         // INFO: Hooks called after the resolution are in reverse order
         // Provider, Invocation, Client, API(global)
-        let after_hooks: Vec<(&HookWrapper, &HookData)> =
-            before_hooks.iter().copied().rev().collect();
+        let after_hooks = || before_hooks().rev();
 
         let (context, result) = self
-            .before_hooks(before_hooks.iter().copied(), &hook_context, hints)
+            .before_hooks(before_hooks(), &hook_context, hints)
             .await;
         hook_context.evaluation_context = &context;
 
@@ -363,16 +358,11 @@ impl Client {
         let evaluation_details;
 
         if let Err(error) = result {
-            self.error_hooks(after_hooks.iter().copied(), &hook_context, &error, hints)
+            self.error_hooks(after_hooks(), &hook_context, &error, hints)
                 .await;
             evaluation_details = EvaluationDetails::error_reason(flag_key, T::default());
-            self.finally_hooks(
-                after_hooks.iter().copied(),
-                &hook_context,
-                &evaluation_details,
-                hints,
-            )
-            .await;
+            self.finally_hooks(after_hooks(), &hook_context, &evaluation_details, hints)
+                .await;
 
             return Err(error);
         }
@@ -387,11 +377,11 @@ impl Client {
             Ok(ref details) => {
                 let details = details.clone().into_value();
                 if let Err(error) = self
-                    .after_hooks(after_hooks.iter().copied(), &hook_context, &details, hints)
+                    .after_hooks(after_hooks(), &hook_context, &details, hints)
                     .await
                 {
                     evaluation_details = EvaluationDetails::error_reason(flag_key, T::default());
-                    self.error_hooks(after_hooks.iter().copied(), &hook_context, &error, hints)
+                    self.error_hooks(after_hooks(), &hook_context, &error, hints)
                         .await;
                 } else {
                     evaluation_details = details;
@@ -399,18 +389,13 @@ impl Client {
             }
             Err(ref error) => {
                 evaluation_details = EvaluationDetails::error_reason(flag_key, T::default());
-                self.error_hooks(after_hooks.iter().copied(), &hook_context, error, hints)
+                self.error_hooks(after_hooks(), &hook_context, error, hints)
                     .await;
             }
         }
 
-        self.finally_hooks(
-            after_hooks.iter().copied(),
-            &hook_context,
-            &evaluation_details,
-            hints,
-        )
-        .await;
+        self.finally_hooks(after_hooks(), &hook_context, &evaluation_details, hints)
+            .await;
 
         result
     }

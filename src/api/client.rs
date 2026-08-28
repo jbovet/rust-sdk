@@ -396,10 +396,16 @@ impl Client {
             return Err(error);
         }
 
-        // INFO: Run the resolution
-        let result = resolve(&*provider, flag_key, &context)
-            .await
-            .map(|details| details.into_evaluation_details(flag_key));
+        // INFO: Run the resolution, unless the SDK-tracked provider status forbids it, in which
+        // case the evaluation defaults and reports the error through the regular error path
+        // https://github.com/open-feature/spec/blob/main/specification/sections/01-flag-evaluation.md#requirement-176
+        // https://github.com/open-feature/spec/blob/main/specification/sections/01-flag-evaluation.md#requirement-177
+        let result = match self.events.resolution_block(&self.metadata.name).await {
+            Some(error) => Err(error),
+            None => resolve(&*provider, flag_key, &context)
+                .await
+                .map(|details| details.into_evaluation_details(flag_key)),
+        };
 
         // INFO: Run the after hooks
         match result {

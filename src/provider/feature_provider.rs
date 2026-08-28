@@ -40,6 +40,11 @@ pub trait FeatureProvider: Send + Sync + 'static {
     /// [`crate::EvaluationErrorCode::ProviderFatal`] code, or [`ProviderStatus::Error`]
     /// otherwise. On success the provider is marked [`ProviderStatus::Ready`] and the
     /// `PROVIDER_READY` handlers run.
+    ///
+    /// The provider stays registered either way, but a [`ProviderStatus::Fatal`] provider is
+    /// never asked to resolve a flag: those evaluations default and report `PROVIDER_FATAL`.
+    /// Return the fatal code for failures the provider cannot recover from (bad credentials,
+    /// an unusable configuration), and an ordinary error code when it can still serve values.
     #[allow(unused_variables)]
     async fn initialize(&mut self, context: &EvaluationContext) -> Result<(), EvaluationError> {
         Ok(())

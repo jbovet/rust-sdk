@@ -346,7 +346,11 @@ client
 ```
 
 `add_handler` returns an id that can be passed to `remove_handler` to unregister the handler.
+An API-level handler observes every provider, so registering one while several providers are already in the associated state runs it once per provider; a client-level handler observes only its own provider and so runs at most once.
+
 The SDK also tracks the status of each provider based on its initialization outcome and emitted events; query it with `api.provider_status()`, `api.named_provider_status(name)` or `client.provider_status()`.
+Flag resolution consults that status: while a provider is `NotReady` (still initializing) or `Fatal` (irrecoverable), the evaluation returns the default value along with a `PROVIDER_NOT_READY` or `PROVIDER_FATAL` error instead of reaching the provider, and the error hooks run.
+`Error` and `Stale` providers keep resolving, since they may still hold usable values.
 
 Providers emit events through the `EventEmitter` handle passed to them via `FeatureProvider::attach_emitter` right before initialization — see [`examples/events.rs`](examples/events.rs) for a complete provider that emits events.
 

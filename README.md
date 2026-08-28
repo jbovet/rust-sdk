@@ -69,8 +69,10 @@ async fn example() -> Result<(), Error> {
 
     // Configure a provider.
     // By default [`NoOpProvider`] is used.
-    // This initializes the provider and returns the initialization result.
-    api.set_provider(NoOpProvider::default()).await.ok();
+    // This initializes the provider; the result reports whether it succeeded.
+    api.set_provider(NoOpProvider::default())
+        .await
+        .expect("provider failed to initialize");
 
     // create a client
     let client = api.create_client();
@@ -96,8 +98,10 @@ async fn extended_example() {
     let mut api = OpenFeature::singleton_mut().await;
 
     // Set the default (unnamed) provider.
-    // This initializes the provider and returns the initialization result.
-    api.set_provider(NoOpProvider::default()).await.ok();
+    // This initializes the provider; the result reports whether it succeeded.
+    api.set_provider(NoOpProvider::default())
+        .await
+        .expect("provider failed to initialize");
 
     // Create an unnamed client.
     let client = api.create_client();
@@ -182,8 +186,10 @@ Once you've added a provider as a dependency, it can be registered with OpenFeat
 //
 // You must `await` it to let the provider's initialization to finish.
 let mut api = OpenFeature::singleton_mut().await;
-// This initializes the provider and returns the initialization result.
-api.set_provider(NoOpProvider::default()).await.ok();
+// This initializes the provider; the result reports whether it succeeded.
+api.set_provider(NoOpProvider::default())
+    .await
+    .expect("provider failed to initialize");
 ```
 
 In some situations, it may be beneficial to register multiple providers in the same application.
@@ -305,7 +311,9 @@ If a name has no associated provider, the global provider is used.
 
 ```rust
 // Create a named provider and bind it.
-api.set_named_provider("named", NoOpProvider::default()).await.ok();
+api.set_named_provider("named", NoOpProvider::default())
+    .await
+    .expect("provider failed to initialize");
 
 // This named client will use the feature provider bound to this name.
 let client = api.create_named_client("named");
@@ -334,7 +342,9 @@ api.add_handler(ProviderEventType::Stale, |details| {
 })
 .await;
 
-api.set_provider(NoOpProvider::default()).await.ok();
+api.set_provider(NoOpProvider::default())
+    .await
+    .expect("provider failed to initialize");
 
 // A client-level handler, only run for events from the provider bound to this client.
 let client = api.create_named_client("my-domain");

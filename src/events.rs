@@ -112,14 +112,19 @@ impl EventEmitter {
         }
     }
 
-    /// Arm the emitter so that subsequent [`EventEmitter::emit`] calls are delivered.
+    /// Arm the emitter so that subsequent readiness events are delivered.
     ///
     /// The SDK arms the emitter only *after* it has dispatched its own terminal
     /// `PROVIDER_READY`/`PROVIDER_ERROR` event derived from the provider's initialization
-    /// outcome. Events a provider emits from within `initialize` are therefore ignored: the SDK
-    /// owns the initial readiness event, so a provider that also signals readiness during
-    /// initialization cannot cause `PROVIDER_READY`/`PROVIDER_ERROR` handlers to run twice
-    /// (spec 5.3.1 / 5.3.2).
+    /// outcome. Readiness events a provider emits from within `initialize` are therefore
+    /// ignored: the SDK owns the initial readiness event, so a provider that also signals
+    /// readiness during initialization cannot cause `PROVIDER_READY`/`PROVIDER_ERROR` handlers
+    /// to run twice (spec 5.3.1 / 5.3.2).
+    ///
+    /// Only those two event types are withheld. `PROVIDER_STALE` and
+    /// `PROVIDER_CONFIGURATION_CHANGED` carry information the SDK does not derive on its own,
+    /// so dropping them would lose it; a provider that starts watching its flag management
+    /// system from within `initialize` can emit them right away.
     pub(crate) fn arm(&self) {
         self.armed.store(true, Ordering::Release);
     }
@@ -128,9 +133,21 @@ impl EventEmitter {
     ///
     /// The associated event handlers are executed on the calling task before this function
     /// returns. Does nothing if the provider owning this emitter is no longer registered, or if
-    /// the SDK has not yet finished initializing it (see [`EventEmitter::arm`]).
+    /// this is a `PROVIDER_READY`/`PROVIDER_ERROR` event emitted before the SDK has finished
+    /// initializing the provider (see [`EventEmitter::arm`]).
     pub async fn emit(&self, event_type: ProviderEventType, details: EventDetails) {
-        if self.armed.load(Ordering::Acquire) && self.active.load(Ordering::Acquire) {
+        // The SDK derives the terminal readiness event from the initialization outcome, so a
+        // provider's own readiness events count only once initialization is complete.
+        let withheld_until_armed = matches!(
+            event_type,
+            ProviderEventType::Ready | ProviderEventType::Error
+        );
+
+        if withheld_until_armed && !self.armed.load(Ordering::Acquire) {
+            return;
+        }
+
+        if self.active.load(Ordering::Acquire) {
             self.registry
                 .dispatch(&self.domain, event_type, &details, &self.active)
                 .await;

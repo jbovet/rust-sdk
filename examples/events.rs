@@ -9,22 +9,22 @@ use open_feature::{
 /// A provider that stores the [`EventEmitter`] handed to it by the SDK and uses it to signal
 /// state changes. A real provider would typically emit from a background task watching its
 /// flag management system.
-struct EventfulProvider {
+struct EventProvider {
     metadata: ProviderMetadata,
     emitter: Arc<Mutex<Option<EventEmitter>>>,
 }
 
-impl Default for EventfulProvider {
+impl Default for EventProvider {
     fn default() -> Self {
         Self {
-            metadata: ProviderMetadata::new("Eventful Provider"),
+            metadata: ProviderMetadata::new("Event Provider"),
             emitter: Arc::new(Mutex::new(None)),
         }
     }
 }
 
 #[async_trait::async_trait]
-impl FeatureProvider for EventfulProvider {
+impl FeatureProvider for EventProvider {
     fn attach_emitter(&mut self, emitter: EventEmitter) {
         *self.emitter.lock().unwrap() = Some(emitter);
     }
@@ -86,7 +86,7 @@ async fn main() {
     })
     .await;
 
-    let provider = EventfulProvider::default();
+    let provider = EventProvider::default();
     let emitter = provider.emitter.clone();
     api.set_provider(provider).await.expect("initialization");
 
@@ -110,7 +110,7 @@ async fn main() {
         .emit(
             ProviderEventType::ConfigurationChanged,
             EventDetails::builder()
-                .provider_name("Eventful Provider")
+                .provider_name("Event Provider")
                 .flags_changed(vec!["v2_enabled".to_string()])
                 .build(),
         )

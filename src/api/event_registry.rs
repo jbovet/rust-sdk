@@ -6,7 +6,10 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::provider::ProviderStatus;
-use crate::{EvaluationErrorCode, EventDetails, EventHandler, EventHandlerId, ProviderEventType};
+use crate::{
+    EvaluationError, EvaluationErrorCode, EventDetails, EventHandler, EventHandlerId,
+    ProviderEventType,
+};
 
 // ============================================================
 //  EventRegistry
@@ -56,29 +59,45 @@ impl EventRegistry {
         event_type: ProviderEventType,
         handler: EventHandler,
     ) -> EventHandlerId {
-        let (id, replay) = {
+        let (id, replays) = {
             let mut inner = self.0.write().await;
 
             inner.next_id += 1;
             let id = EventHandlerId(inner.next_id);
 
-            // Determine whether the provider is already in the state associated with
-            // `event_type`. For API-level handlers the default provider's state is consulted.
-            let domain = match &scope {
-                Some(domain) if inner.bound_domains.contains(domain) => domain.as_str(),
-                _ => "",
-            };
-            let replay = inner.domains.get(domain).and_then(|state| {
-                if event_matches_status(event_type, state.status) {
-                    Some(state.last_details.clone().unwrap_or_else(|| {
-                        EventDetails::builder()
-                            .provider_name(state.provider_name.clone())
-                            .build()
-                    }))
+            // Collect the providers that are already in the state associated with `event_type`,
+            // so that the handler observes them on registration exactly as it would have
+            // observed the corresponding events had it been registered earlier (spec 5.3.3).
+            let replays: Vec<EventDetails> = if let Some(domain) = &scope {
+                // A client-level handler observes a single provider: the one bound to its
+                // domain, or the default provider when its domain has none.
+                let domain = if inner.bound_domains.contains(domain) {
+                    domain.as_str()
                 } else {
-                    None
-                }
-            });
+                    ""
+                };
+                inner
+                    .domains
+                    .get(domain)
+                    .and_then(|state| replay_details(event_type, state))
+                    .into_iter()
+                    .collect()
+            } else {
+                // An API-level handler observes events from every provider, so it replays once
+                // per provider that is already in the associated state.
+                let mut matching: Vec<(&str, EventDetails)> = inner
+                    .domains
+                    .iter()
+                    .filter_map(|(domain, state)| {
+                        replay_details(event_type, state).map(|details| (domain.as_str(), details))
+                    })
+                    .collect();
+
+                // `domains` is a `HashMap`, so order the replays to keep the sequence a handler
+                // observes deterministic across runs.
+                matching.sort_by_key(|(domain, _)| *domain);
+                matching.into_iter().map(|(_, details)| details).collect()
+            };
 
             inner
                 .handlers
@@ -86,11 +105,11 @@ impl EventRegistry {
                 .or_default()
                 .push((id, handler.clone()));
 
-            (id, replay)
+            (id, replays)
         };
 
         // Run outside the lock, as handlers may interact with the SDK (spec 5.3.3).
-        if let Some(details) = replay {
+        for details in replays {
             invoke_handler(&handler, &details);
         }
 
@@ -122,6 +141,45 @@ impl EventRegistry {
             .domains
             .get(domain)
             .map_or(ProviderStatus::NotReady, |state| state.status)
+    }
+
+    /// The error a flag resolution must fail with, given the tracked status of the provider
+    /// serving `domain`, or `None` when resolution may proceed (spec 1.7.6 / 1.7.7).
+    ///
+    /// A domain with no tracked state is served by the default provider the SDK registers
+    /// implicitly, which is available from the start and so never blocks resolution.
+    ///
+    /// [`ProviderStatus::Error`] does not block: a provider that failed to initialize may still
+    /// serve cached values, and only the irrecoverable [`ProviderStatus::Fatal`] is terminal.
+    /// [`ProviderStatus::Stale`] does not block either, as stale values are still values.
+    pub async fn resolution_block(&self, domain: &str) -> Option<EvaluationError> {
+        let inner = self.0.read().await;
+
+        let domain = if inner.bound_domains.contains(domain) {
+            domain
+        } else {
+            ""
+        };
+
+        let state = inner.domains.get(domain)?;
+
+        match state.status {
+            ProviderStatus::NotReady => Some(EvaluationError {
+                code: EvaluationErrorCode::ProviderNotReady,
+                message: Some(format!(
+                    "provider '{}' has not finished initializing",
+                    state.provider_name
+                )),
+            }),
+            ProviderStatus::Fatal => Some(EvaluationError {
+                code: EvaluationErrorCode::ProviderFatal,
+                message: Some(format!(
+                    "provider '{}' is in an irrecoverable error state",
+                    state.provider_name
+                )),
+            }),
+            ProviderStatus::Ready | ProviderStatus::Error | ProviderStatus::Stale => None,
+        }
     }
 
     /// Record that a new provider is being registered for `domain`, deactivating the previous
@@ -176,8 +234,21 @@ impl EventRegistry {
 
             if let Some(status) = status_of_event(event_type, details) {
                 if let Some(state) = inner.domains.get_mut(domain) {
-                    state.status = status;
-                    state.last_details = Some(details.clone());
+                    // While a provider is still initializing the SDK owns its status: only the
+                    // terminal PROVIDER_READY/PROVIDER_ERROR derived from the initialization
+                    // outcome may move the domain out of NOT_READY. Provider-emitted readiness
+                    // events cannot reach this point before then (they are withheld until the
+                    // emitter is armed), so a PROVIDER_STALE emitted from within `initialize` is
+                    // the only other candidate. It still reaches the handlers, but must not mark
+                    // the provider resolvable while it is not (spec 1.7.6).
+                    let sdk_terminal = matches!(
+                        event_type,
+                        ProviderEventType::Ready | ProviderEventType::Error
+                    );
+                    if sdk_terminal || state.status != ProviderStatus::NotReady {
+                        state.status = status;
+                        state.last_details = Some(details.clone());
+                    }
                 }
             }
 
@@ -252,6 +323,20 @@ fn status_of_event(
         }
         ProviderEventType::Stale => Some(ProviderStatus::Stale),
         ProviderEventType::ConfigurationChanged => None,
+    }
+}
+
+/// The details to replay to a handler for `event_type` registered while `state`'s provider is
+/// already in the associated state, or `None` if it is not in that state (spec 5.3.3).
+fn replay_details(event_type: ProviderEventType, state: &DomainState) -> Option<EventDetails> {
+    if event_matches_status(event_type, state.status) {
+        Some(state.last_details.clone().unwrap_or_else(|| {
+            EventDetails::builder()
+                .provider_name(state.provider_name.clone())
+                .build()
+        }))
+    } else {
+        None
     }
 }
 
@@ -350,24 +435,41 @@ mod tests {
         }
     }
 
-    /// A misbehaving provider that emits `PROVIDER_READY` itself from within `initialize`, in
-    /// addition to the terminal readiness event the SDK derives from the initialization outcome.
-    struct EmitReadyDuringInitProvider {
+    /// A provider that emits an event of its own from within `initialize`, before the SDK has
+    /// dispatched the terminal readiness event it derives from the initialization outcome.
+    struct EmitDuringInitProvider {
         metadata: ProviderMetadata,
         emitter: Mutex<Option<EventEmitter>>,
+        event: ProviderEventType,
+        flags_changed: Vec<String>,
     }
 
-    impl EmitReadyDuringInitProvider {
-        fn new(name: &str) -> Self {
+    impl EmitDuringInitProvider {
+        /// A misbehaving provider that signals readiness itself, duplicating the event the SDK
+        /// owns.
+        fn ready(name: &str) -> Self {
             Self {
                 metadata: ProviderMetadata::new(name),
                 emitter: Mutex::new(None),
+                event: ProviderEventType::Ready,
+                flags_changed: Vec::new(),
+            }
+        }
+
+        /// A well-behaved provider that starts watching its flag management system while
+        /// initializing and reports a change it observes there.
+        fn configuration_changed(name: &str, flags_changed: Vec<String>) -> Self {
+            Self {
+                metadata: ProviderMetadata::new(name),
+                emitter: Mutex::new(None),
+                event: ProviderEventType::ConfigurationChanged,
+                flags_changed,
             }
         }
     }
 
     #[async_trait]
-    impl FeatureProvider for EmitReadyDuringInitProvider {
+    impl FeatureProvider for EmitDuringInitProvider {
         fn attach_emitter(&mut self, emitter: EventEmitter) {
             *self.emitter.lock().unwrap() = Some(emitter);
         }
@@ -379,9 +481,10 @@ mod tests {
             let emitter = self.emitter.lock().unwrap().clone().unwrap();
             emitter
                 .emit(
-                    ProviderEventType::Ready,
+                    self.event,
                     EventDetails::builder()
                         .provider_name(self.metadata.name.clone())
+                        .flags_changed(self.flags_changed.clone())
                         .build(),
                 )
                 .await;
@@ -923,6 +1026,17 @@ mod tests {
         let events = EventRegistry::default();
         let token = events.on_provider_set("", "test").await;
 
+        // Complete the registration first: while a provider is still initializing the SDK holds
+        // the status at NOT_READY, which is covered by `provider_events_cannot_clear_not_ready`.
+        events
+            .dispatch(
+                "",
+                ProviderEventType::Ready,
+                &EventDetails::builder().provider_name("test").build(),
+                &token,
+            )
+            .await;
+
         // The handler reads the tracked status while it is being invoked; it must already
         // reflect the event being dispatched.
         let observed = Arc::new(Mutex::new(None));
@@ -964,7 +1078,7 @@ mod tests {
 
         // The provider signals PROVIDER_READY itself while initializing; the SDK owns the
         // terminal readiness event, so handlers must still run exactly once (not twice).
-        api.set_provider(EmitReadyDuringInitProvider::new("eager"))
+        api.set_provider(EmitDuringInitProvider::ready("eager"))
             .await
             .unwrap();
 
@@ -1018,6 +1132,260 @@ mod tests {
             .await;
         assert_eq!(count.load(Ordering::SeqCst), 1);
         assert_eq!(events.provider_status("").await, ProviderStatus::Ready);
+    }
+
+    #[spec(
+        number = "5.3.3",
+        text = "Handlers attached after the provider is already in the associated state, MUST run immediately."
+    )]
+    #[tokio::test]
+    async fn api_handlers_replay_for_every_provider_already_in_state() {
+        let mut api = OpenFeature::default();
+
+        // Two named providers reach READY before any handler exists. An API-level handler runs
+        // for events from *any* provider, so on registration it must observe both, exactly as
+        // it would have observed both PROVIDER_READY events had it been registered earlier.
+        api.set_named_provider("db", provider("db-provider"))
+            .await
+            .unwrap();
+        api.set_named_provider("cache", provider("cache-provider"))
+            .await
+            .unwrap();
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let captured = seen.clone();
+        api.add_handler(ProviderEventType::Ready, move |details| {
+            captured.lock().unwrap().push(details.provider_name.clone());
+        })
+        .await;
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["cache-provider".to_string(), "db-provider".to_string()],
+            "an API-level handler must replay once per provider already in the READY state"
+        );
+    }
+
+    #[spec(
+        number = "5.3.3",
+        text = "Handlers attached after the provider is already in the associated state, MUST run immediately."
+    )]
+    #[tokio::test]
+    async fn client_handlers_replay_only_for_their_own_provider() {
+        let mut api = OpenFeature::default();
+
+        api.set_named_provider("db", provider("db-provider"))
+            .await
+            .unwrap();
+        api.set_named_provider("cache", provider("cache-provider"))
+            .await
+            .unwrap();
+
+        // A client-level handler observes a single provider, so it replays at most once even
+        // though two providers are READY.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let captured = seen.clone();
+        api.create_named_client("db")
+            .add_handler(ProviderEventType::Ready, move |details| {
+                captured.lock().unwrap().push(details.provider_name.clone());
+            })
+            .await;
+
+        assert_eq!(*seen.lock().unwrap(), vec!["db-provider".to_string()]);
+    }
+
+    #[spec(
+        number = "5.1.2",
+        text = "When a provider signals the occurrence of a particular event, the associated client and API event handlers MUST run."
+    )]
+    #[tokio::test]
+    async fn configuration_changed_during_initialize_is_delivered() {
+        let mut api = OpenFeature::default();
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let captured = seen.clone();
+        api.add_handler(ProviderEventType::ConfigurationChanged, move |details| {
+            captured.lock().unwrap().push(details.flags_changed.clone());
+        })
+        .await;
+
+        // Only PROVIDER_READY/PROVIDER_ERROR are withheld until the SDK has dispatched its own
+        // terminal readiness event. A configuration change carries information the SDK cannot
+        // derive on its own, so it must survive being emitted from within `initialize`.
+        api.set_provider(EmitDuringInitProvider::configuration_changed(
+            "watcher",
+            vec!["v2_enabled".to_string()],
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![vec!["v2_enabled".to_string()]],
+            "a configuration change emitted during initialization must not be dropped"
+        );
+    }
+
+    #[spec(
+        number = "1.7.6",
+        text = "The client MUST default, run error hooks, and indicate an error if flag resolution is attempted while the provider is in NOT_READY."
+    )]
+    #[tokio::test]
+    async fn resolution_is_blocked_while_the_provider_is_not_ready() {
+        let events = EventRegistry::default();
+
+        // No tracked state means the default provider the SDK registers implicitly, which is
+        // usable from the start.
+        assert!(events.resolution_block("").await.is_none());
+
+        // A registration in flight is NOT_READY until initialization completes.
+        let token = events.on_provider_set("", "slow").await;
+        let error = events
+            .resolution_block("")
+            .await
+            .expect("a NOT_READY provider must block resolution");
+        assert_eq!(error.code, EvaluationErrorCode::ProviderNotReady);
+
+        events
+            .dispatch(
+                "",
+                ProviderEventType::Ready,
+                &EventDetails::builder().provider_name("slow").build(),
+                &token,
+            )
+            .await;
+        assert!(events.resolution_block("").await.is_none());
+    }
+
+    #[spec(
+        number = "1.7.7",
+        text = "The client MUST default, run error hooks, and indicate an error if flag resolution is attempted while the provider is in FATAL."
+    )]
+    #[tokio::test]
+    async fn fatal_provider_defaults_instead_of_resolving() {
+        let mut api = OpenFeature::default();
+
+        let mut provider = MockFeatureProvider::new();
+        provider.expect_attach_emitter().return_const(());
+        provider.expect_hooks().return_const(vec![]);
+        provider
+            .expect_metadata()
+            .return_const(ProviderMetadata::new("fatal"));
+        provider.expect_initialize().returning(|_| {
+            Err(EvaluationError::builder()
+                .code(EvaluationErrorCode::ProviderFatal)
+                .message("bad credentials")
+                .build())
+        });
+        // A provider that failed to initialize must never be asked to resolve a flag.
+        provider.expect_resolve_bool_value().never();
+
+        api.set_provider(provider).await.unwrap_err();
+        assert_eq!(api.provider_status().await, ProviderStatus::Fatal);
+
+        let error = api
+            .create_client()
+            .get_bool_value("flag", None, None)
+            .await
+            .expect_err("a FATAL provider must not resolve flags");
+        assert_eq!(error.code, EvaluationErrorCode::ProviderFatal);
+    }
+
+    /// A provider in ERROR or STALE state may still hold usable values, so neither status is
+    /// terminal for flag resolution.
+    #[tokio::test]
+    async fn error_and_stale_providers_still_resolve() {
+        let events = EventRegistry::default();
+        let token = events.on_provider_set("", "test").await;
+
+        for (event, details) in [
+            (
+                ProviderEventType::Error,
+                EventDetails::builder()
+                    .provider_name("test")
+                    .error_code(EvaluationErrorCode::ParseError)
+                    .build(),
+            ),
+            (
+                ProviderEventType::Stale,
+                EventDetails::builder().provider_name("test").build(),
+            ),
+        ] {
+            events.dispatch("", event, &details, &token).await;
+            assert!(
+                events.resolution_block("").await.is_none(),
+                "{event} must not block resolution"
+            );
+        }
+    }
+
+    #[spec(
+        number = "1.7.6",
+        text = "The client MUST default, run error hooks, and indicate an error if flag resolution is attempted while the provider is in NOT_READY."
+    )]
+    #[tokio::test]
+    async fn provider_events_cannot_clear_not_ready() {
+        let events = EventRegistry::default();
+        let token = events.on_provider_set("", "initializing").await;
+
+        let count = Arc::new(AtomicUsize::new(0));
+        events
+            .add_handler(
+                None,
+                ProviderEventType::Stale,
+                Arc::new(counting_handler(&count)),
+            )
+            .await;
+
+        // A provider that reports a stale cache from within `initialize` must still reach the
+        // handlers, but must not make itself resolvable before the SDK says it is ready.
+        events
+            .dispatch(
+                "",
+                ProviderEventType::Stale,
+                &EventDetails::builder()
+                    .provider_name("initializing")
+                    .build(),
+                &token,
+            )
+            .await;
+
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "the event still dispatches"
+        );
+        assert_eq!(events.provider_status("").await, ProviderStatus::NotReady);
+        assert!(
+            events.resolution_block("").await.is_some(),
+            "resolution stays blocked until initialization completes"
+        );
+
+        // The SDK's terminal event is what releases it.
+        events
+            .dispatch(
+                "",
+                ProviderEventType::Ready,
+                &EventDetails::builder()
+                    .provider_name("initializing")
+                    .build(),
+                &token,
+            )
+            .await;
+        assert!(events.resolution_block("").await.is_none());
+
+        // Once initialized, STALE moves the status as usual.
+        events
+            .dispatch(
+                "",
+                ProviderEventType::Stale,
+                &EventDetails::builder()
+                    .provider_name("initializing")
+                    .build(),
+                &token,
+            )
+            .await;
+        assert_eq!(events.provider_status("").await, ProviderStatus::Stale);
     }
 
     /// Read the tracked status from within a synchronous handler.

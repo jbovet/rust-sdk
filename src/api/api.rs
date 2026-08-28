@@ -69,9 +69,9 @@ impl OpenFeature {
     /// Set the default provider.
     ///
     /// This function initializes the provider and returns the initialization result. Even when
-    /// initialization fails, the provider stays registered (in `Error` status), so the returned
-    /// error may safely be ignored — discard it explicitly with `.ok()` to avoid the
-    /// `unused_must_use` warning:
+    /// initialization fails the provider stays registered, in `Error` status, and keeps serving
+    /// flag resolutions from whatever state it does have — so the returned error may be
+    /// discarded with `.ok()` to avoid the `unused_must_use` warning:
     ///
     /// ```no_run
     /// # async fn run() {
@@ -81,6 +81,11 @@ impl OpenFeature {
     /// api.set_provider(NoOpProvider::default()).await.ok();
     /// # }
     /// ```
+    ///
+    /// The exception is an error carrying [`crate::EvaluationErrorCode::ProviderFatal`], which
+    /// puts the provider in `Fatal` status. Flag resolution then defaults and reports
+    /// `PROVIDER_FATAL` instead of reaching the provider at all, so check the result when a
+    /// provider may fail fatally.
     pub async fn set_provider<T: FeatureProvider>(
         &mut self,
         provider: T,
@@ -90,10 +95,7 @@ impl OpenFeature {
 
     /// Bind the given `provider` to the corresponding `name`.
     ///
-    /// This function initializes the provider and returns the initialization result. Even when
-    /// initialization fails, the provider stays registered (in `Error` status), so the returned
-    /// error may safely be ignored — discard it explicitly with `.ok()` to avoid the
-    /// `unused_must_use` warning.
+    /// Initialization and error handling work as described on [`OpenFeature::set_provider`].
     pub async fn set_named_provider<T: FeatureProvider>(
         &mut self,
         name: &str,
@@ -111,8 +113,8 @@ impl OpenFeature {
     /// Register an API-level `handler` that runs whenever any provider emits an event of the
     /// given `event_type`.
     ///
-    /// If the default provider is already in the state associated with `event_type`, the handler
-    /// runs immediately.
+    /// Because the handler observes every provider, it runs immediately once per provider that
+    /// is already in the state associated with `event_type`.
     ///
     /// The returned id can be passed to [`OpenFeature::remove_handler`] to unregister the
     /// handler.

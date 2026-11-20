@@ -5,7 +5,7 @@ async fn main() {
     init_logger();
 
     let mut api = OpenFeature::singleton_mut().await;
-    api.set_provider(NoOpProvider::default()).await;
+    api.set_provider(NoOpProvider::default()).await.ok();
     drop(api);
 
     let client = OpenFeature::singleton()

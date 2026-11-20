@@ -133,7 +133,7 @@ async fn main() {
         .init();
 
     let mut api = OpenFeature::singleton_mut().await;
-    api.set_provider(DummyProvider::default()).await;
+    api.set_provider(DummyProvider::default()).await.ok();
     drop(api);
 
     let client = OpenFeature::singleton()
